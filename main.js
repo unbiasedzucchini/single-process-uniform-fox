@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { DatabaseSync } = require('node:sqlite');
 
 const usage = `Usage:
   node main.js <cas_dir> write -           Write stdin to CAS
@@ -37,6 +38,42 @@ function getFilePath(casDir, hash) {
   return path.join(casDir, subdir, filename);
 }
 
+// Audit log database (lives in _audit.db to avoid collision with CAS content)
+let auditDb = null;
+
+function initAuditDb(casDir) {
+  fs.mkdirSync(casDir, { recursive: true });
+  const dbPath = path.join(casDir, '_audit.db');
+  auditDb = new DatabaseSync(dbPath);
+  auditDb.exec(`
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      command TEXT NOT NULL,
+      arguments TEXT NOT NULL,
+      success INTEGER NOT NULL,
+      error_message TEXT,
+      output_name TEXT
+    )
+  `);
+}
+
+function logAudit(command, args, success, errorMessage = null, outputName = null) {
+  if (!auditDb) return;
+  const stmt = auditDb.prepare(`
+    INSERT INTO audit_log (timestamp, command, arguments, success, error_message, output_name)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  stmt.run(
+    new Date().toISOString(),
+    command,
+    JSON.stringify(args),
+    success ? 1 : 0,
+    errorMessage,
+    outputName
+  );
+}
+
 async function write(casDir, source) {
   let data;
   if (source === '-') {
@@ -45,27 +82,16 @@ async function write(casDir, source) {
     data = fs.readFileSync(source);
   }
 
-  const hash = computeHash(data);
-  const filePath = getFilePath(casDir, hash);
-  const dir = path.dirname(filePath);
-
-  // Create directory if needed
-  fs.mkdirSync(dir, { recursive: true });
-
-  // Only write if not already present (content-addressable = immutable)
-  if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, data);
-  }
-
+  const hash = writeCAS(casDir, data);
   console.log(hash);
+  return hash;
 }
 
 function readCAS(casDir, name) {
   const filePath = getFilePath(casDir, name);
 
   if (!fs.existsSync(filePath)) {
-    console.error(`Error: ${name} not found in CAS`);
-    process.exit(1);
+    throw new Error(`${name} not found in CAS`);
   }
 
   return fs.readFileSync(filePath);
@@ -90,31 +116,31 @@ function writeCAS(casDir, data) {
   return hash;
 }
 
-// Edit operation helper: read, transform, write, output new hash
+// Edit operation helper: read, transform, write, return new hash
 function edit(casDir, name, transformFn) {
   const data = readCAS(casDir, name);
   const text = data.toString('utf8');
   const newText = transformFn(text);
   const newHash = writeCAS(casDir, Buffer.from(newText, 'utf8'));
   console.log(newHash);
+  return newHash;
 }
 
 // Text/Line editing primitives
 function replace(casDir, name, oldStr, newStr) {
-  edit(casDir, name, text => text.replace(oldStr, newStr));
+  return edit(casDir, name, text => text.replace(oldStr, newStr));
 }
 
 function replaceAll(casDir, name, oldStr, newStr) {
-  edit(casDir, name, text => text.split(oldStr).join(newStr));
+  return edit(casDir, name, text => text.split(oldStr).join(newStr));
 }
 
 function lineInsert(casDir, name, lineNum, newLine) {
-  edit(casDir, name, text => {
+  return edit(casDir, name, text => {
     const lines = text.split('\n');
     const idx = lineNum - 1; // Convert to 0-indexed
     if (idx < 0 || idx > lines.length) {
-      console.error(`Error: line ${lineNum} out of range (1-${lines.length + 1})`);
-      process.exit(1);
+      throw new Error(`line ${lineNum} out of range (1-${lines.length + 1})`);
     }
     lines.splice(idx, 0, newLine);
     return lines.join('\n');
@@ -122,12 +148,11 @@ function lineInsert(casDir, name, lineNum, newLine) {
 }
 
 function lineDelete(casDir, name, lineNum) {
-  edit(casDir, name, text => {
+  return edit(casDir, name, text => {
     const lines = text.split('\n');
     const idx = lineNum - 1;
     if (idx < 0 || idx >= lines.length) {
-      console.error(`Error: line ${lineNum} out of range (1-${lines.length})`);
-      process.exit(1);
+      throw new Error(`line ${lineNum} out of range (1-${lines.length})`);
     }
     lines.splice(idx, 1);
     return lines.join('\n');
@@ -135,12 +160,11 @@ function lineDelete(casDir, name, lineNum) {
 }
 
 function lineReplace(casDir, name, lineNum, newLine) {
-  edit(casDir, name, text => {
+  return edit(casDir, name, text => {
     const lines = text.split('\n');
     const idx = lineNum - 1;
     if (idx < 0 || idx >= lines.length) {
-      console.error(`Error: line ${lineNum} out of range (1-${lines.length})`);
-      process.exit(1);
+      throw new Error(`line ${lineNum} out of range (1-${lines.length})`);
     }
     lines[idx] = newLine;
     return lines.join('\n');
@@ -148,11 +172,73 @@ function lineReplace(casDir, name, lineNum, newLine) {
 }
 
 function append(casDir, name, text) {
-  edit(casDir, name, content => content + text);
+  return edit(casDir, name, content => content + text);
 }
 
 function prepend(casDir, name, text) {
-  edit(casDir, name, content => text + content);
+  return edit(casDir, name, content => text + content);
+}
+
+async function runCommand(casDir, command, rest) {
+  switch (command) {
+    case 'write':
+      if (rest.length !== 1) {
+        throw new Error('write requires exactly one argument (- or file path)');
+      }
+      return await write(casDir, rest[0]);
+
+    case 'read':
+      if (rest.length !== 1) {
+        throw new Error('read requires exactly one argument (hash name)');
+      }
+      read(casDir, rest[0]);
+      return null; // read outputs to stdout, no CAS output name
+
+    case 'replace':
+      if (rest.length !== 3) {
+        throw new Error('replace requires: <name> <old> <new>');
+      }
+      return replace(casDir, rest[0], rest[1], rest[2]);
+
+    case 'replace-all':
+      if (rest.length !== 3) {
+        throw new Error('replace-all requires: <name> <old> <new>');
+      }
+      return replaceAll(casDir, rest[0], rest[1], rest[2]);
+
+    case 'line-insert':
+      if (rest.length !== 3) {
+        throw new Error('line-insert requires: <name> <line-num> <text>');
+      }
+      return lineInsert(casDir, rest[0], parseInt(rest[1], 10), rest[2]);
+
+    case 'line-delete':
+      if (rest.length !== 2) {
+        throw new Error('line-delete requires: <name> <line-num>');
+      }
+      return lineDelete(casDir, rest[0], parseInt(rest[1], 10));
+
+    case 'line-replace':
+      if (rest.length !== 3) {
+        throw new Error('line-replace requires: <name> <line-num> <text>');
+      }
+      return lineReplace(casDir, rest[0], parseInt(rest[1], 10), rest[2]);
+
+    case 'append':
+      if (rest.length !== 2) {
+        throw new Error('append requires: <name> <text>');
+      }
+      return append(casDir, rest[0], rest[1]);
+
+    case 'prepend':
+      if (rest.length !== 2) {
+        throw new Error('prepend requires: <name> <text>');
+      }
+      return prepend(casDir, rest[0], rest[1]);
+
+    default:
+      throw new Error(`Unknown command: ${command}`);
+  }
 }
 
 async function main() {
@@ -165,87 +251,17 @@ async function main() {
 
   const [casDir, command, ...rest] = args;
 
-  switch (command) {
-    case 'write':
-      if (rest.length !== 1) {
-        console.error('write requires exactly one argument (- or file path)');
-        process.exit(1);
-      }
-      await write(casDir, rest[0]);
-      break;
+  // Initialize audit database
+  initAuditDb(casDir);
 
-    case 'read':
-      if (rest.length !== 1) {
-        console.error('read requires exactly one argument (hash name)');
-        process.exit(1);
-      }
-      read(casDir, rest[0]);
-      break;
-
-    case 'replace':
-      if (rest.length !== 3) {
-        console.error('replace requires: <name> <old> <new>');
-        process.exit(1);
-      }
-      replace(casDir, rest[0], rest[1], rest[2]);
-      break;
-
-    case 'replace-all':
-      if (rest.length !== 3) {
-        console.error('replace-all requires: <name> <old> <new>');
-        process.exit(1);
-      }
-      replaceAll(casDir, rest[0], rest[1], rest[2]);
-      break;
-
-    case 'line-insert':
-      if (rest.length !== 3) {
-        console.error('line-insert requires: <name> <line-num> <text>');
-        process.exit(1);
-      }
-      lineInsert(casDir, rest[0], parseInt(rest[1], 10), rest[2]);
-      break;
-
-    case 'line-delete':
-      if (rest.length !== 2) {
-        console.error('line-delete requires: <name> <line-num>');
-        process.exit(1);
-      }
-      lineDelete(casDir, rest[0], parseInt(rest[1], 10));
-      break;
-
-    case 'line-replace':
-      if (rest.length !== 3) {
-        console.error('line-replace requires: <name> <line-num> <text>');
-        process.exit(1);
-      }
-      lineReplace(casDir, rest[0], parseInt(rest[1], 10), rest[2]);
-      break;
-
-    case 'append':
-      if (rest.length !== 2) {
-        console.error('append requires: <name> <text>');
-        process.exit(1);
-      }
-      append(casDir, rest[0], rest[1]);
-      break;
-
-    case 'prepend':
-      if (rest.length !== 2) {
-        console.error('prepend requires: <name> <text>');
-        process.exit(1);
-      }
-      prepend(casDir, rest[0], rest[1]);
-      break;
-
-    default:
-      console.error(`Unknown command: ${command}`);
-      console.error(usage);
-      process.exit(1);
+  try {
+    const outputName = await runCommand(casDir, command, rest);
+    logAudit(command, rest, true, null, outputName);
+  } catch (err) {
+    logAudit(command, rest, false, err.message, null);
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
   }
 }
 
-main().catch(err => {
-  console.error(err.message);
-  process.exit(1);
-});
+main();
