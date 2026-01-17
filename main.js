@@ -17,7 +17,10 @@ Edit operations (read from CAS, modify, write back, output new name):
   node main.js <cas_dir> line-delete <name> <n>           Delete line n (1-indexed)
   node main.js <cas_dir> line-replace <name> <n> <text>   Replace line n (1-indexed)
   node main.js <cas_dir> append <name> <text>             Append text to end
-  node main.js <cas_dir> prepend <name> <text>            Prepend text to beginning`;
+  node main.js <cas_dir> prepend <name> <text>            Prepend text to beginning
+
+LLM operations:
+  node main.js <cas_dir> llm <model> <system> <prompt>    Call LLM, tee output to CAS and stdout`;
 
 async function readStdin() {
   const chunks = [];
@@ -179,6 +182,77 @@ function prepend(casDir, name, text) {
   return edit(casDir, name, content => text + content);
 }
 
+// LLM operation via OpenRouter
+async function llm(casDir, model, system, prompt) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    throw new Error('OPENROUTER_API_KEY environment variable not set');
+  }
+
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: model,
+      stream: true,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: prompt },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`OpenRouter API error: ${response.status} ${text}`);
+  }
+
+  // Stream the response, collecting output
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let fullOutput = '';
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop(); // Keep incomplete line in buffer
+
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        const data = line.slice(6);
+        if (data === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (content) {
+            process.stdout.write(content);
+            fullOutput += content;
+          }
+        } catch (e) {
+          // Skip malformed JSON
+        }
+      }
+    }
+  }
+
+  // Ensure newline at end of output
+  if (fullOutput && !fullOutput.endsWith('\n')) {
+    process.stdout.write('\n');
+  }
+
+  // Write to CAS and return hash
+  const hash = writeCAS(casDir, Buffer.from(fullOutput, 'utf8'));
+  console.error(`CAS: ${hash}`);
+  return hash;
+}
+
 async function runCommand(casDir, command, rest) {
   switch (command) {
     case 'write':
@@ -235,6 +309,12 @@ async function runCommand(casDir, command, rest) {
         throw new Error('prepend requires: <name> <text>');
       }
       return prepend(casDir, rest[0], rest[1]);
+
+    case 'llm':
+      if (rest.length !== 3) {
+        throw new Error('llm requires: <model> <system> <prompt>');
+      }
+      return await llm(casDir, rest[0], rest[1], rest[2]);
 
     default:
       throw new Error(`Unknown command: ${command}`);
